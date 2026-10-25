@@ -26,7 +26,7 @@ PROFILE = "ga5-incident-agent/v2"
 LLM_BASE = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 LLM_KEY = os.getenv("LLM_API_KEY", "")
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "15"))
 DB_PATH = os.getenv("DB_PATH", "incidents.db")
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -156,15 +156,31 @@ JSON shape:
 
 
 def call_llm(messages):
-    payload = {"model": MODEL, "messages": messages, "temperature": 0,
-               "response_format": {"type": "json_object"}, "max_tokens": 1500}
-    r = requests.post(f"{LLM_BASE}/chat/completions",
-                      headers={"Authorization": f"Bearer {LLM_KEY}"},
-                      json=payload, timeout=LLM_TIMEOUT)
-    r.raise_for_status()
-    txt = r.json()["choices"][0]["message"]["content"]
-    m = re.search(r"\{.*\}", txt, re.S)
-    return json.loads(m.group(0))
+    base = {"model": MODEL, "messages": messages}
+    variants = [
+        {**base, "temperature": 0, "response_format": {"type": "json_object"}, "max_tokens": 1500},
+        {**base, "response_format": {"type": "json_object"}, "max_completion_tokens": 1500},
+        {**base},
+    ]
+    last = "no attempt"
+    for payload in variants:
+        r = requests.post(f"{LLM_BASE}/chat/completions",
+                          headers={"Authorization": f"Bearer {LLM_KEY}"},
+                          json=payload, timeout=LLM_TIMEOUT)
+        if r.status_code >= 400:
+            last = f"HTTP {r.status_code}: {r.text[:300]}"
+            print("LLM error:", last, flush=True)
+            if r.status_code in (400, 422):
+                continue  # unsupported parameter -> try a simpler payload
+            raise RuntimeError(last)
+        txt = r.json()["choices"][0]["message"]["content"] or ""
+        m = re.search(r"\{.*\}", txt, re.S)
+        if not m:
+            last = "no JSON in model reply: " + txt[:200]
+            print("LLM error:", last, flush=True)
+            continue
+        return json.loads(m.group(0))
+    raise RuntimeError(last)
 
 
 def _eid(e):
@@ -259,7 +275,8 @@ def plan_run(body):
     for _ in range(2):  # at most one repair round
         try:
             raw = call_llm(msgs)
-        except Exception:
+        except Exception as e:
+            print(f"planner call failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
             raise Bad(502, "planner_unavailable")
         norm, errs = normalize(raw, inc["allowedRootCauses"], known, catalog, effect_tools, max_diag)
         if not errs:
@@ -267,6 +284,10 @@ def plan_run(body):
         msgs += [{"role": "assistant", "content": json.dumps(raw)},
                  {"role": "user", "content": "Fix these problems and return the full JSON again: " + "; ".join(errs[:8])}]
     t1 = time.time_ns()
+    if errs:
+        print("planner validation problems:", errs[:8], flush=True)
+    if not norm["effect"] and norm["fallback"]:
+        norm["effect"] = norm["fallback"]
     if not (norm["rootCause"] in inc["allowedRootCauses"] and len(norm["evidence"]) >= 2
             and norm["diagnostics"] and norm["effect"]):
         raise Bad(502, "planner_invalid")
